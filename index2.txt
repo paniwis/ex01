@@ -1,0 +1,381 @@
+<?php
+mysqli_report(MYSQLI_REPORT_OFF);
+$conn = new mysqli("localhost", "root", "", "tienda_pedidos", 3307);   
+if ($conn->connect_error) {
+    die("Conexion fallida: " . $conn->connect_error);
+}
+
+
+if (isset($_GET["reporte"])) {
+    include "fpdf/fpdf.php";
+
+    function texto($valor) {
+        return iconv("UTF-8", "windows-1252//TRANSLIT", (string)$valor);
+    }
+    
+    function generarPDF($titulo, $encabezados, $anchos, $campos, $res, $extra = "") {
+        $pdf = new FPDF();
+        $pdf->AddPage();
+
+        $pdf->SetFont("Arial", "B", 14);
+        $pdf->Cell(190, 10, texto($titulo), 0, 1, "C");
+        $pdf->SetFont("Arial", "", 10);
+        $pdf->Cell(190, 8, "Fecha: " . date("d/m/Y"), 0, 1, "C");
+        $pdf->Ln(3);
+
+        $pdf->SetFont("Arial", "B", 10);
+        for ($i = 0; $i < count($encabezados); $i++) {
+            $salto = ($i == count($encabezados) - 1) ? 1 : 0;
+            $pdf->Cell($anchos[$i], 8, texto($encabezados[$i]), 1, $salto, "C");
+        }
+
+        $pdf->SetFont("Arial", "", 10);
+        while ($fila = $res->fetch_assoc()) {
+            for ($i = 0; $i < count($campos); $i++) {
+                $salto = ($i == count($campos) - 1) ? 1 : 0;
+                $pdf->Cell($anchos[$i], 8, texto($fila[$campos[$i]]), 1, $salto, "C");
+            }
+        }
+
+        $pdf->Ln(3);
+        $pdf->Cell(190, 8, "Total de registros: " . $res->num_rows, 0, 1, "L");
+        if ($extra != "") {
+            $pdf->SetFont("Arial", "B", 10);
+            $pdf->Cell(190, 8, texto($extra), 0, 1, "L");
+        }
+        $pdf->Output("I", "reporte.pdf");
+        exit;   
+    }
+
+    $buscar = isset($_GET["buscar"]) ? $_GET["buscar"] : "";
+    $like = "%" . $buscar . "%";
+
+    if ($_GET["reporte"] == "productos") {
+        $stmt = $conn->prepare("SELECT * FROM productos WHERE codigo LIKE ? OR nombre LIKE ?");
+        $stmt->bind_param("ss", $like, $like);
+        $stmt->execute();
+        generarPDF("Reporte de productos",
+                   array("CÓDIGO", "NOMBRE", "PRECIO", "STOCK"),
+                   array(30, 90, 35, 35),
+                   array("codigo", "nombre", "precio", "stock"),
+                   $stmt->get_result());
+    }
+    if ($_GET["reporte"] == "pedidos") {
+       
+        $stmt = $conn->prepare("SELECT SUM(p.precio * pe.cantidad) AS total
+                                FROM clientes c, pedidos pe, productos p
+                                WHERE c.cedula = pe.cedula AND p.codigo = pe.codigo
+                                AND c.nombre LIKE ?");
+        $stmt->bind_param("s", $like);
+        $stmt->execute();
+        $total = $stmt->get_result()->fetch_assoc()["total"];
+
+        $stmt = $conn->prepare("SELECT pe.id_pedido, c.nombre AS cliente, pe.fecha, p.nombre AS producto,
+                                       pe.cantidad, p.precio, p.precio * pe.cantidad AS subtotal
+                                FROM clientes c, pedidos pe, productos p
+                                WHERE c.cedula = pe.cedula AND p.codigo = pe.codigo
+                                AND c.nombre LIKE ?
+                                ORDER BY pe.id_pedido");
+        $stmt->bind_param("s", $like);
+        $stmt->execute();
+        generarPDF("Reporte de pedidos",
+                   array("PEDIDO", "CLIENTE", "FECHA", "PRODUCTO", "CANT.", "PRECIO", "SUBTOTAL"),
+                   array(18, 37, 25, 40, 18, 25, 27),
+                   array("id_pedido", "cliente", "fecha", "producto", "cantidad", "precio", "subtotal"),
+                   $stmt->get_result(),
+                   "Total vendido: $" . number_format((float)$total, 2));
+    }
+}
+
+// ---- PRODUCTOS: guardar (nuevo o editar) ----
+if (isset($_POST["guardar_producto"])) {
+    if ($_POST["original"] == "") {
+        $stmt = $conn->prepare("INSERT INTO productos VALUES (?, ?, ?, ?)");
+        $stmt->bind_param("ssdi", $_POST["codigo"], $_POST["nombre"], $_POST["precio"], $_POST["stock"]);
+    } else {
+        $stmt = $conn->prepare("UPDATE productos SET codigo=?, nombre=?, precio=?, stock=? WHERE codigo=?");
+        $stmt->bind_param("ssdis", $_POST["codigo"], $_POST["nombre"], $_POST["precio"], $_POST["stock"], $_POST["original"]);
+    }
+    if (!$stmt->execute()) {
+        die("Error al guardar el producto: " . $conn->error . " <a href='index.php'>Volver</a>");
+    }
+    header("Location: index.php");
+    exit;
+}
+
+// ---- PRODUCTOS: eliminar ----
+if (isset($_GET["eliminar_producto"])) {
+    $stmt = $conn->prepare("DELETE FROM productos WHERE codigo=?");
+    $stmt->bind_param("s", $_GET["eliminar_producto"]);
+    $stmt->execute();
+    header("Location: index.php");
+    exit;
+}
+
+// ---- CLIENTES: guardar ----
+if (isset($_POST["guardar_cliente"])) {
+    $stmt = $conn->prepare("INSERT INTO clientes VALUES (?, ?, ?)");
+    $stmt->bind_param("sss", $_POST["cedula"], $_POST["nombre"], $_POST["telefono"]);
+    if (!$stmt->execute()) {
+        die("Error al guardar el cliente: " . $conn->error . " <a href='index.php'>Volver</a>");
+    }
+    header("Location: index.php");
+    exit;
+}
+
+// ---- CLIENTES: eliminar (se borran tambien sus pedidos por el CASCADE) ----
+if (isset($_GET["eliminar_cliente"])) {
+    $stmt = $conn->prepare("DELETE FROM clientes WHERE cedula=?");
+    $stmt->bind_param("s", $_GET["eliminar_cliente"]);
+    $stmt->execute();
+    header("Location: index.php");
+    exit;
+}
+
+// ---- PEDIDOS: registrar (cliente, producto, cantidad y fecha) ----
+if (isset($_POST["registrar_pedido"])) {
+    $cedula = $_POST["cedula"];
+    $codigo = $_POST["codigo"];
+    $cantidad = $_POST["cantidad"];
+
+    // 1. Revisar que haya stock
+    $stmt = $conn->prepare("SELECT stock FROM productos WHERE codigo=?");
+    $stmt->bind_param("s", $codigo);
+    $stmt->execute();
+    $producto = $stmt->get_result()->fetch_assoc();
+    if ($producto["stock"] < $cantidad) {
+        die("No hay stock suficiente. <a href='index.php'>Volver</a>");
+    }
+
+    // 2. Guardar el pedido (el id_pedido lo pone MySQL solo)
+    $stmt = $conn->prepare("INSERT INTO pedidos (cedula, codigo, cantidad, fecha) VALUES (?, ?, ?, ?)");
+    $stmt->bind_param("ssis", $cedula, $codigo, $cantidad, $_POST["fecha"]);
+    $stmt->execute();
+
+    // 3. Descontar el stock
+    $stmt = $conn->prepare("UPDATE productos SET stock = stock - ? WHERE codigo=?");
+    $stmt->bind_param("is", $cantidad, $codigo);
+    $stmt->execute();
+
+    header("Location: index.php");
+    exit;
+}
+
+// ---- PEDIDOS: eliminar (devuelve el stock) ----
+if (isset($_GET["eliminar_pedido"])) {
+    $id_pedido = $_GET["eliminar_pedido"];
+
+    // 1. Devolver el stock (antes de borrar, para poder leer la cantidad y el producto)
+    $stmt = $conn->prepare("UPDATE productos p, pedidos pe SET p.stock = p.stock + pe.cantidad
+                            WHERE p.codigo = pe.codigo AND pe.id_pedido=?");
+    $stmt->bind_param("i", $id_pedido);
+    $stmt->execute();
+
+    // 2. Borrar el pedido
+    $stmt = $conn->prepare("DELETE FROM pedidos WHERE id_pedido=?");
+    $stmt->bind_param("i", $id_pedido);
+    $stmt->execute();
+
+    header("Location: index.php");
+    exit;
+}
+
+// 4. DATOS PARA MOSTRAR
+// Producto a editar (?editar=codigo): llena el formulario de productos
+$editar = array("codigo" => "", "nombre" => "", "precio" => "", "stock" => "");
+$original = "";
+if (isset($_GET["editar"])) {
+    $stmt = $conn->prepare("SELECT * FROM productos WHERE codigo=?");
+    $stmt->bind_param("s", $_GET["editar"]);
+    $stmt->execute();
+    $editar = $stmt->get_result()->fetch_assoc();
+    $original = $editar["codigo"];
+}
+
+// Productos con filtro (?buscar=...)
+$buscar = isset($_GET["buscar"]) ? $_GET["buscar"] : "";
+$like = "%" . $buscar . "%";
+$stmt = $conn->prepare("SELECT * FROM productos WHERE codigo LIKE ? OR nombre LIKE ?");
+$stmt->bind_param("ss", $like, $like);
+$stmt->execute();
+$productos = $stmt->get_result();
+
+// Clientes
+$clientes = $conn->query("SELECT * FROM clientes ORDER BY nombre");
+
+// Pedidos uniendo las 3 tablas, con filtro por cliente (?cliente=...)
+$cliente = isset($_GET["cliente"]) ? $_GET["cliente"] : "";
+$likeCliente = "%" . $cliente . "%";
+$stmt = $conn->prepare("SELECT pe.id_pedido, c.nombre AS cliente, pe.fecha, p.nombre AS producto,
+                               pe.cantidad, p.precio, p.precio * pe.cantidad AS subtotal
+                        FROM clientes c, pedidos pe, productos p
+                        WHERE c.cedula = pe.cedula AND p.codigo = pe.codigo
+                        AND c.nombre LIKE ?
+                        ORDER BY pe.id_pedido");
+$stmt->bind_param("s", $likeCliente);
+$stmt->execute();
+$pedidos = $stmt->get_result();
+
+// Listas para los select (cada consulta se recorre una sola vez)
+$listaClientesPedido = $conn->query("SELECT cedula, nombre FROM clientes ORDER BY nombre");
+$listaClientesFiltro = $conn->query("SELECT nombre FROM clientes ORDER BY nombre");
+$listaProductos = $conn->query("SELECT codigo, nombre, stock FROM productos ORDER BY nombre");
+?>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Tienda</title>
+</head>
+<body>
+    <h1>Tienda</h1>
+    <a href="#productos">Productos</a> |
+    <a href="#clientes">Clientes</a> |
+    <a href="#pedidos">Pedidos</a>
+    <hr>
+
+    <!-- PRODUCTOS                                                      -->
+    <h2 id="productos"><?php echo $original == "" ? "Nuevo producto" : "Editar producto"; ?></h2>
+
+    <form method="post" action="index.php">
+        <input type="hidden" name="original" value="<?php echo $original; ?>">
+        Código <input type="text" name="codigo" value="<?php echo $editar["codigo"]; ?>" required>
+        Nombre <input type="text" name="nombre" value="<?php echo $editar["nombre"]; ?>" required>
+        Precio <input type="number" step="0.01" name="precio" value="<?php echo $editar["precio"]; ?>" required>
+        Stock <input type="number" name="stock" value="<?php echo $editar["stock"]; ?>" required>
+        <input type="submit" name="guardar_producto" value="Guardar">
+        <a href="index.php">Cancelar</a>
+    </form>
+    <br>
+
+    <form method="get" action="index.php">
+        <input type="text" name="buscar" value="<?php echo $buscar; ?>" placeholder="Código o nombre">
+        <input type="submit" value="Filtrar">
+        <a href="index.php">Mostrar todos</a> |
+        <a href="index.php?reporte=productos&buscar=<?php echo urlencode($buscar); ?>" target="_blank">Reporte</a>
+    </form>
+    <br>
+
+    <table border="1">
+        <tr>
+            <th>Código</th>
+            <th>Nombre</th>
+            <th>Precio</th>
+            <th>Stock</th>
+            <th>Acciones</th>
+        </tr>
+        <?php while ($fila = $productos->fetch_assoc()) { ?>
+            <tr>
+                <td><?php echo $fila["codigo"]; ?></td>
+                <td><?php echo $fila["nombre"]; ?></td>
+                <td><?php echo $fila["precio"]; ?></td>
+                <td><?php echo $fila["stock"]; ?></td>
+                <td>
+                    <a href="index.php?editar=<?php echo $fila["codigo"]; ?>">Editar</a>
+                    <a href="index.php?eliminar_producto=<?php echo $fila["codigo"]; ?>" onclick="return confirm('¿Eliminar este producto?')">Eliminar</a>
+                </td>
+            </tr>
+        <?php } ?>
+    </table>
+
+    <hr>
+
+    <!-- CLIENTES                                                       -->
+ 
+    <h2 id="clientes">Clientes</h2>
+
+    <form method="post" action="index.php">
+        Cédula <input type="text" name="cedula" required>
+        Nombre <input type="text" name="nombre" required>
+        Teléfono <input type="text" name="telefono">
+        <input type="submit" name="guardar_cliente" value="Guardar cliente">
+    </form>
+    <br>
+
+    <table border="1">
+        <tr>
+            <th>Cédula</th>
+            <th>Nombre</th>
+            <th>Teléfono</th>
+            <th>Acción</th>
+        </tr>
+        <?php while ($fila = $clientes->fetch_assoc()) { ?>
+            <tr>
+                <td><?php echo $fila["cedula"]; ?></td>
+                <td><?php echo $fila["nombre"]; ?></td>
+                <td><?php echo $fila["telefono"]; ?></td>
+                <td><a href="index.php?eliminar_cliente=<?php echo $fila["cedula"]; ?>" onclick="return confirm('¿Eliminar este cliente y sus pedidos?')">Eliminar</a></td>
+            </tr>
+        <?php } ?>
+    </table>
+
+    <hr>
+
+    <!-- PEDIDOS                                                        -->
+
+    <h2 id="pedidos">Pedidos</h2>
+
+    <!-- Registrar pedido -->
+    <form method="post" action="index.php">
+        <b>Nuevo pedido:</b>
+        <select name="cedula">
+            <?php while ($c = $listaClientesPedido->fetch_assoc()) { ?>
+                <option value="<?php echo $c["cedula"]; ?>"><?php echo $c["nombre"]; ?></option>
+            <?php } ?>
+        </select>
+        <select name="codigo">
+            <?php while ($p = $listaProductos->fetch_assoc()) { ?>
+                <option value="<?php echo $p["codigo"]; ?>"><?php echo $p["nombre"] . " (stock " . $p["stock"] . ")"; ?></option>
+            <?php } ?>
+        </select>
+        Cantidad <input type="number" name="cantidad" min="1" value="1" required>
+        <input type="date" name="fecha" required>
+        <input type="submit" name="registrar_pedido" value="Registrar">
+    </form>
+    <br>
+
+    <!-- Filtro por cliente y reportes -->
+    <form method="get" action="index.php">
+        <b>Cliente:</b>
+        <select name="cliente">
+            <option value="">Todos</option>
+            <?php while ($c = $listaClientesFiltro->fetch_assoc()) { ?>
+                <option value="<?php echo $c["nombre"]; ?>" <?php if ($c["nombre"] == $cliente) echo "selected"; ?>><?php echo $c["nombre"]; ?></option>
+            <?php } ?>
+        </select>
+        <input type="submit" value="Filtrar">
+        <a href="index.php?reporte=pedidos&buscar=<?php echo urlencode($cliente); ?>" target="_blank">Reporte de pedidos</a> |
+        <a href="index.php?reporte=masvendidos" target="_blank">Más vendidos</a>
+    </form>
+    <br>
+
+    <table border="1">
+        <tr>
+            <th>Pedido</th>
+            <th>Cliente</th>
+            <th>Fecha</th>
+            <th>Producto</th>
+            <th>Cantidad</th>
+            <th>Precio</th>
+            <th>Subtotal</th>
+            <th>Acción</th>
+        </tr>
+        <?php
+        $total = 0;
+        while ($fila = $pedidos->fetch_assoc()) {
+            $total = $total + $fila["subtotal"];
+        ?>
+            <tr>
+                <td><?php echo $fila["id_pedido"]; ?></td>
+                <td><?php echo $fila["cliente"]; ?></td>
+                <td><?php echo $fila["fecha"]; ?></td>
+                <td><?php echo $fila["producto"]; ?></td>
+                <td><?php echo $fila["cantidad"]; ?></td>
+                <td><?php echo $fila["precio"]; ?></td>
+                <td><?php echo $fila["subtotal"]; ?></td>
+                <td><a href="index.php?eliminar_pedido=<?php echo $fila["id_pedido"]; ?>" onclick="return confirm('¿Eliminar este pedido?')">Eliminar</a></td>
+            </tr>
+        <?php } ?>
+    </table>
+    <p><b>Total: $<?php echo number_format($total, 2); ?></b></p>
+</body>
+</html>
